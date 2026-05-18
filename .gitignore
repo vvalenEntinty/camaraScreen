@@ -1,0 +1,16 @@
+# Modelo MediaPipe (14 MB, se descarga automáticamente)
+hand_landmarker.task
+
+# Sonidos personales
+sonidos/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
