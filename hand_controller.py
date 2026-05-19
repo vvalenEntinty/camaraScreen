@@ -16,6 +16,7 @@ import ctypes
 import threading
 import subprocess
 import queue
+from collections import deque
 import argparse
 from typing import Optional, Tuple
 
@@ -27,26 +28,131 @@ def _move_cursor(x: int, y: int):
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
+
+def _get_monitor_hz() -> int:
+    """Refresh rate del monitor primario via Win32 GetDeviceCaps (VREFRESH=116)."""
+    hdc = ctypes.windll.user32.GetDC(0)
+    hz  = ctypes.windll.gdi32.GetDeviceCaps(hdc, 116)
+    ctypes.windll.user32.ReleaseDC(0, hdc)
+    return max(hz, 60)
+
+
+class _MouseMover:
+    """Mueve el cursor en un hilo dedicado a la frecuencia del monitor."""
+
+    def __init__(self, hz: int):
+        self._interval = 1.0 / hz
+        # half-life 8 ms → ~95 % de convergencia dentro de un frame de 30 fps (~33 ms)
+        self._alpha  = 1.0 - 0.5 ** (self._interval / 0.008)
+        self._lock   = threading.Lock()
+        self._tx     = 0.0
+        self._ty     = 0.0
+        self._active = False
+        self._stop   = threading.Event()
+        # Resolución de timer a 1 ms para que time.sleep sea preciso a alta frecuencia
+        ctypes.windll.winmm.timeBeginPeriod(1)
+        threading.Thread(target=self._run, daemon=True).start()
+        print(f"  Mouse mover: {hz} Hz  (alpha={self._alpha:.3f})")
+
+    def set_target(self, x: int, y: int):
+        with self._lock:
+            self._tx = float(x)
+            self._ty = float(y)
+            self._active = True
+
+    def set_inactive(self):
+        with self._lock:
+            self._active = False
+
+    def stop(self):
+        self._stop.set()
+        ctypes.windll.winmm.timeEndPeriod(1)
+
+    def _run(self):
+        cx = cy = 0.0
+        initialized = False
+        while not self._stop.is_set():
+            t0 = time.perf_counter()
+            with self._lock:
+                active = self._active
+                tx, ty = self._tx, self._ty
+            if active:
+                if not initialized:
+                    cx, cy = tx, ty
+                    initialized = True
+                cx += self._alpha * (tx - cx)
+                cy += self._alpha * (ty - cy)
+                _move_cursor(int(cx), int(cy))
+            else:
+                initialized = False
+            rem = self._interval - (time.perf_counter() - t0)
+            if rem > 0.0001:
+                time.sleep(rem)
+
+# ─────────────────────────── Auto-encuadre ────────────────────────────
+
+class AutoFramer:
+    FACE_SCALE   = 4.5
+    CROP_MIN     = 0.50
+    CROP_MAX     = 0.98
+    SIZE_LERP    = 0.12
+    POS_LERP      = 0.10
+    POS_SOFT_ZONE = 0.04   # banda suave: lerp escala de 0 a 1 dentro de este rango
+
+    def __init__(self, fw: int, fh: int):
+        self._fw = fw
+        self._fh = fh
+        self._cw = int(fw * 0.75)
+        self._ch = int(fh * 0.75)
+        self._cx = float(fw // 2)
+        self._cy = float(fh // 2)
+
+    def update(self, face_nx: float, face_ny: float, face_pw: float = 0.0):
+        if face_pw > 0:
+            target_cw = int(self._fw * face_pw * self.FACE_SCALE)
+            target_cw = max(int(self._fw * self.CROP_MIN),
+                            min(int(self._fw * self.CROP_MAX), target_cw))
+            target_ch = int(target_cw * self._fh / self._fw)
+            self._cw  = int(self._cw + self.SIZE_LERP * (target_cw - self._cw))
+            self._ch  = int(self._ch + self.SIZE_LERP * (target_ch - self._ch))
+        dx   = face_nx * self._fw - self._cx
+        dy   = face_ny * self._fh - self._cy
+        dist = math.sqrt(dx * dx + dy * dy)
+        t    = min(1.0, max(0.0, dist / (self._fw * self.POS_SOFT_ZONE) - 1.0))
+        self._cx += self.POS_LERP * t * dx
+        self._cy += self.POS_LERP * t * dy
+
+    def get_crop(self) -> Tuple[int, int, int, int]:
+        x0 = max(0, int(self._cx) - self._cw // 2)
+        y0 = max(0, int(self._cy) - self._ch // 2)
+        x1 = min(self._fw, x0 + self._cw)
+        y1 = min(self._fh, y0 + self._ch)
+        if x1 - x0 < self._cw:
+            x0 = max(0, x1 - self._cw)
+        if y1 - y0 < self._ch:
+            y0 = max(0, y1 - self._ch)
+        return x0, y0, x1, y1
+
+
 # ═══════════════════════════ CONFIGURACIÓN ════════════════════════════
-CAMERA_ID  = 0
-FRAME_W    = 640
-FRAME_H    = 480
+CAMERA_ID   = 0
+RESOLUTIONS = [(960, 540), (640, 360), (640, 480)]
 
 SCREEN_W, SCREEN_H = pyautogui.size()
 
 # One Euro Filter — reduce jitter sin agregar lag
-OEF_MINCUTOFF = 3.5    # menor = más suavizado cuando la mano está quieta
-OEF_BETA      = 1.8    # mayor = más responsivo cuando la mano se mueve rápido
+OEF_MINCUTOFF = 2.5    # menor = más suavizado cuando la mano está quieta
+OEF_BETA      = 2.5    # mayor = más responsivo cuando la mano se mueve rápido
 MARGIN              = 0.12
 FIST_MAX_OPEN       = 1
-CLICK_MAX_HOLD      = 0.35
-DRAG_START_HOLD     = 0.45
-DOUBLE_FIST_WINDOW  = 0.50
 SCROLL_SPEED_FACTOR = 3000  # scrolls/segundo por unidad^2 de offset (escala cuadratica)
 SCROLL_DEADZONE     = 0.04  # zona muerta central antes de empezar a scrollear
 PINCH_THRESHOLD     = 0.06  # distancia normalizada pulgar-indice para detectar pinch
 DRAG_PINCH_HOLD     = 0.5   # segundos manteniendo pinch para activar arrastre
 ZOOM_SENSITIVITY    = 50    # clicks de zoom por unidad de distancia entre manos
+FACE_DET_SCALE      = 0.5  # fracción del frame para detección de cara (menos pixels = más rápido)
+DISPLAY_SCALE       = 1.5  # escala del preview (1.0 = tamaño nativo de la cámara)
+HUD_BAR_H           = 90   # altura en px de la franja de info debajo del video
 # ══════════════════════════════════════════════════════════════════════
 
 MODEL_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
@@ -93,12 +199,31 @@ HAND_CONNECTIONS = [
 
 class CameraCapture:
     """Lee frames en un hilo dedicado para que siempre tengamos el más fresco."""
-    def __init__(self, camera_id: int, width: int, height: int):
+    def __init__(self, camera_id: int, resolutions: list):
         self._cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # minimiza frames en buffer
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        for w, h in resolutions:
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            got_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            got_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if abs(got_w - w) <= 4 and abs(got_h - h) <= 4:
+                self.width  = got_w
+                self.height = got_h
+                print(f"  Cámara resolución: {self.width}x{self.height}")
+                break
+        else:
+            self.width  = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"  Cámara resolución (fallback): {self.width}x{self.height}")
+        for target_fps in (30, 25, 24):
+            self._cap.set(cv2.CAP_PROP_FPS, target_fps)
+            got = self._cap.get(cv2.CAP_PROP_FPS)
+            if abs(got - target_fps) <= 2:
+                print(f"  Cámara FPS: {got:.0f}")
+                break
         self._frame: Optional[np.ndarray] = None
+        self._frame_id: int = 0
         self._lock  = threading.Lock()
         self._alive = True
         self._thread = threading.Thread(target=self._reader, daemon=True)
@@ -110,12 +235,13 @@ class CameraCapture:
             if ret:
                 with self._lock:
                     self._frame = frame
+                    self._frame_id += 1
 
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+    def read(self) -> Tuple[bool, Optional[np.ndarray], int]:
         with self._lock:
             if self._frame is None:
-                return False, None
-            return True, self._frame.copy()
+                return False, None, -1
+            return True, self._frame.copy(), self._frame_id
 
     @property
     def opened(self) -> bool:
@@ -293,7 +419,8 @@ class Smoother:
 # ──────────────────────── Controlador principal ────────────────────────
 
 class HandController:
-    def __init__(self):
+    def __init__(self, mover: '_MouseMover'):
+        self._mover  = mover
         self._smooth = Smoother()
 
         self._fist_active   = False
@@ -369,13 +496,17 @@ class HandController:
         self._pinch_blocked = False
         self._handle_peace(False)
         self._smooth.clear()
+        self._mover.set_inactive()
         self.status = "Sin mano detectada"
 
     def cleanup(self):
-        if self._dragging:
-            pyautogui.mouseUp()
-        if self._zoom_active:
-            pyautogui.keyUp('ctrl')
+        try:
+            if self._dragging:
+                pyautogui.mouseUp()
+            if self._zoom_active:
+                pyautogui.keyUp('ctrl')
+        except pyautogui.FailSafeException:
+            pass
         self._handle_peace(False)
 
     def _flash(self, text: str, dur: float = 0.9):
@@ -449,14 +580,14 @@ class HandController:
 
     def _move_mouse(self, is_pinch: bool, mx: int, my: int, now: float, n_open: int):
         if self._dragging:
-            _move_cursor(mx, my)
+            self._mover.set_target(mx, my)
             self.status = f"Arrastrando ({mx}, {my})"
         elif is_pinch:
             held = now - self._pinch_start
-            _move_cursor(mx, my)
+            self._mover.set_target(mx, my)
             self.status = f"Pinch {held:.1f}s / {DRAG_PINCH_HOLD:.0f}s"
         else:
-            _move_cursor(mx, my)
+            self._mover.set_target(mx, my)
             self.status = f"({mx}, {my})  dedos: {n_open}/5"
 
     def update_zoom(self, active: bool, dist: float, now: float):
@@ -495,10 +626,6 @@ class HandController:
     def zooming(self) -> bool:
         return self._zoom_active
 
-    @property
-    def pinching(self) -> bool:
-        return self._pinch_active
-
 
 # ──────────────────────────── Overlay ────────────────────────────────
 
@@ -507,8 +634,10 @@ class HandOverlay:
     SIZE = 180
 
     def __init__(self):
-        self._q     = queue.Queue(maxsize=2)
-        self._alive = True
+        self._q      = queue.Queue(maxsize=2)
+        self._alive  = True
+        self._paused = False
+        self._done   = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
 
     def update(self, nx: float, ny: float, visible: bool,
@@ -518,8 +647,12 @@ class HandOverlay:
         except queue.Full:
             pass
 
+    def set_paused(self, paused: bool):
+        self._paused = paused
+
     def close(self):
         self._alive = False
+        self._done.wait(timeout=2.0)
 
     def _run(self):
         import tkinter as tk
@@ -558,6 +691,7 @@ class HandOverlay:
         def redraw():
             if not self._alive:
                 root.destroy()
+                self._done.set()
                 return
             try:
                 while True:
@@ -567,26 +701,33 @@ class HandOverlay:
 
             cv.delete("all")
 
+            paused = self._paused
+            border = "#ff4444" if paused else EDGE
+
             # fondo
             cv.create_rectangle(0, 0, S, S, fill="#0a0a1a", outline="")
             # zona activa del mouse (sin margen)
             cv.create_rectangle(M, M, S - M, S - M, fill="", outline=ZONE, width=1)
             # borde exterior con esquinas marcadas
-            cv.create_rectangle(1, 1, S - 1, S - 1, outline=EDGE, width=2)
+            cv.create_rectangle(1, 1, S - 1, S - 1, outline=border, width=2)
             # esquinas reforzadas
             c = 10
             for x0, y0, x1, y1 in [(1,1,c,1),(1,1,1,c),(S-c,1,S-1,1),(S-1,1,S-1,c),
                                      (1,S-c,1,S-1),(1,S-1,c,S-1),(S-c,S-1,S-1,S-1),(S-1,S-c,S-1,S-1)]:
-                cv.create_line(x0, y0, x1, y1, fill=EDGE, width=3)
+                cv.create_line(x0, y0, x1, y1, fill=border, width=3)
 
-            if vis_v[0]:
+            if paused:
+                cv.create_text(S // 2, S // 2, text="PAUSA",
+                               fill="#ff4444", font=("Arial", 13, "bold"))
+
+            if vis_v[0] and not paused:
                 dx = int(nx_v[0] * S)
                 dy = int(ny_v[0] * S)
                 r  = 7
                 cv.create_oval(dx-r+1, dy-r+1, dx+r+1, dy+r+1, fill="#003333", outline="")
                 cv.create_oval(dx-r, dy-r, dx+r, dy+r, fill=EDGE, outline="")
 
-            if vis2_v[0]:
+            if vis2_v[0] and not paused:
                 dx2 = int(nx2_v[0] * S)
                 dy2 = int(ny2_v[0] * S)
                 r   = 7
@@ -600,6 +741,33 @@ class HandOverlay:
 
 
 # ──────────────────────────── HUD ─────────────────────────────────────
+
+def _choose_face(faces, preferred_nxy, cap_w: int, cap_h: int):
+    """Devuelve la cara más cercana a preferred_nxy (coordenadas norm. 0-1), o faces[0]."""
+    if preferred_nxy is None or len(faces) <= 1:
+        return faces[0]
+    inv    = 1.0 / FACE_DET_SCALE
+    pref_x = preferred_nxy[0] * cap_w
+    pref_y = preferred_nxy[1] * cap_h
+    best, best_d = faces[0], float('inf')
+    for f in faces:
+        fx, fy, fw, fh = f
+        cx = (fx + fw / 2) * inv
+        cy = (fy + fh / 2) * inv
+        d  = (cx - pref_x) ** 2 + (cy - pref_y) ** 2
+        if d < best_d:
+            best, best_d = f, d
+    return best
+
+
+_HUD_LEGENDS = [
+    "Mano abierta -> mover",
+    "Pinch        -> click izq",
+    "Pinch 0.5s   -> arrastrar",
+    "Puno         -> scroll",
+    "2x Pinch     -> zoom",
+    "V (paz)      -> Peron",
+]
 
 def draw_hud(frame, ctrl: HandController, fingers, is_fist, is_pinch, is_peace, now):
     h, w = frame.shape[:2]
@@ -628,10 +796,6 @@ def draw_hud(frame, ctrl: HandController, fingers, is_fist, is_pinch, is_peace, 
     cv2.putText(frame, ind_label, (w - 80, 55),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, ind_color, 1, cv2.LINE_AA)
 
-    cv2.rectangle(frame, (0, h - 42), (w, h), (15, 15, 15), -1)
-    cv2.putText(frame, ctrl.status, (10, h - 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 210, 210), 1, cv2.LINE_AA)
-
     gesture = ctrl.gesture_overlay
     if gesture:
         tw = cv2.getTextSize(gesture, cv2.FONT_HERSHEY_DUPLEX, 1.1, 2)[0][0]
@@ -640,156 +804,114 @@ def draw_hud(frame, ctrl: HandController, fingers, is_fist, is_pinch, is_peace, 
         cv2.putText(frame, gesture, ((w - tw) // 2, h // 2),
                     cv2.FONT_HERSHEY_DUPLEX, 1.1, col, 2, cv2.LINE_AA)
 
-    legends = [
-        "Mano abierta -> mover",
-        "Pinch        -> click izq",
-        "Pinch 0.5s   -> arrastrar",
-        "Puno         -> scroll V+H",
-        "2x Pinch     -> zoom",
-        "V (paz)      -> Peron",
-    ]
-    for i, line in enumerate(legends):
-        cv2.putText(frame, line, (w - 215, h - 100 + i * 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (150, 150, 150), 1, cv2.LINE_AA)
+
+def _enumerate_cameras(max_check: int = 5) -> list:
+    """Prueba índices 0..max_check-1 y devuelve los que se abren correctamente."""
+    found = []
+    for i in range(max_check):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            found.append(i)
+        cap.release()
+    return found if found else [0]
 
 
-# ──────────────────────────── Tray icon (Win32 puro) ──────────────────
+# ──────────────────────────── Tray icon (pystray) ─────────────────────
 
 class _TrayIcon:
-    """Icono en bandeja del sistema via Win32 API. Sin dependencias extra."""
-    _WM_TRAY = 0x8001
-    _ID_QUIT = 9001
+    """Icono en bandeja del sistema via pystray."""
 
-    def __init__(self, stop_event: threading.Event):
-        self._stop        = stop_event
-        self._hwnd        = None
-        self._wndproc_ref = None   # evitar GC del callback
+    def __init__(self, stop_event: threading.Event, camera_ids: list, initial_cam: int):
+        self._stop   = stop_event
+        self._icon   = None
+        self._paused    = False
+        self._autoframe = False
+        self._camera_ids    = camera_ids
+        self._current_cam   = initial_cam
+        self._requested_cam = initial_cam
+        self._lock      = threading.Lock()
+
+    @property
+    def paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    @property
+    def autoframe(self) -> bool:
+        with self._lock:
+            return self._autoframe
+
+    @property
+    def requested_camera(self) -> int:
+        with self._lock:
+            return self._requested_cam
+
+    def acknowledge_camera(self, cam_id: int):
+        with self._lock:
+            self._current_cam = cam_id
 
     def run(self):
-        """Llamar desde un hilo daemon."""
-        u32     = ctypes.windll.user32
-        shell32 = ctypes.windll.shell32
-        k32     = ctypes.windll.kernel32
+        import pystray
+        from PIL import Image, ImageDraw
 
-        WM_DESTROY    = 0x0002
-        WM_RBUTTONUP  = 0x0205
-        NIM_ADD       = 0
-        NIM_DELETE    = 2
-        NIF_MESSAGE   = 0x1
-        NIF_ICON      = 0x2
-        NIF_TIP       = 0x4
-        TPM_RETURNCMD = 0x0100
-        TPM_NONOTIFY  = 0x0080
-        MF_STRING     = 0x0000
+        img  = Image.new("RGBA", (64, 64), (10, 10, 26, 255))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse([14, 14, 50, 50], fill=(0, 229, 204, 255))
 
-        class _NID(ctypes.Structure):
-            _fields_ = [
-                ("cbSize",           ctypes.c_ulong),
-                ("hWnd",             ctypes.c_void_p),
-                ("uID",              ctypes.c_uint),
-                ("uFlags",           ctypes.c_uint),
-                ("uCallbackMessage", ctypes.c_uint),
-                ("hIcon",            ctypes.c_void_p),
-                ("szTip",            ctypes.c_wchar * 128),
-            ]
+        def on_toggle(icon, item):
+            with self._lock:
+                self._paused = not self._paused
 
-        class _WNDCLASSEX(ctypes.Structure):
-            _fields_ = [
-                ("cbSize",        ctypes.c_uint),
-                ("style",         ctypes.c_uint),
-                ("lpfnWndProc",   ctypes.c_void_p),
-                ("cbClsExtra",    ctypes.c_int),
-                ("cbWndExtra",    ctypes.c_int),
-                ("hInstance",     ctypes.c_void_p),
-                ("hIcon",         ctypes.c_void_p),
-                ("hCursor",       ctypes.c_void_p),
-                ("hbrBackground", ctypes.c_void_p),
-                ("lpszMenuName",  ctypes.c_wchar_p),
-                ("lpszClassName", ctypes.c_wchar_p),
-                ("hIconSm",       ctypes.c_void_p),
-            ]
+        def on_autoframe(icon, item):
+            with self._lock:
+                self._autoframe = not self._autoframe
 
-        class _MSG(ctypes.Structure):
-            _fields_ = [
-                ("hwnd",    ctypes.c_void_p),
-                ("message", ctypes.c_uint),
-                ("wParam",  ctypes.c_uint),
-                ("lParam",  ctypes.c_long),
-                ("time",    ctypes.c_ulong),
-                ("pt",      ctypes.c_long * 2),
-            ]
+        def on_quit(icon, item):
+            icon.stop()
+            self._stop.set()
 
-        WNDPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_long,
-            ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_long,
+        def make_cam_handler(cam_id):
+            def handler(icon, item):
+                with self._lock:
+                    self._requested_cam = cam_id
+            return handler
+
+        def make_cam_checked(cam_id):
+            def checked(item):
+                with self._lock:
+                    return self._current_cam == cam_id
+            return checked
+
+        cam_items = [
+            pystray.MenuItem(
+                f"Cámara {cam_id}",
+                make_cam_handler(cam_id),
+                checked=make_cam_checked(cam_id),
+                radio=True,
+            )
+            for cam_id in self._camera_ids
+        ]
+
+        menu = pystray.Menu(
+            pystray.MenuItem(
+                lambda item: "Reanudar" if self._paused else "Pausar",
+                on_toggle,
+            ),
+            pystray.MenuItem(
+                lambda item: "Auto-encuadre: ON" if self._autoframe else "Auto-encuadre: OFF",
+                on_autoframe,
+            ),
+            pystray.MenuItem("Cámara", pystray.Menu(*cam_items)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Cerrar Hand Controller", on_quit),
         )
 
-        def wnd_proc(hwnd, msg, wp, lp):
-            if msg == self._WM_TRAY and lp == WM_RBUTTONUP:
-                hmenu = u32.CreatePopupMenu()
-                u32.AppendMenuW(hmenu, MF_STRING, self._ID_QUIT, "Cerrar Hand Controller")
-                pt = ctypes.wintypes.POINT()
-                u32.GetCursorPos(ctypes.byref(pt))
-                u32.SetForegroundWindow(hwnd)
-                cmd = u32.TrackPopupMenu(
-                    hmenu, TPM_RETURNCMD | TPM_NONOTIFY,
-                    pt.x, pt.y, 0, hwnd, None,
-                )
-                u32.DestroyMenu(hmenu)
-                if cmd == self._ID_QUIT:
-                    u32.PostMessageW(hwnd, WM_DESTROY, 0, 0)
-                return 0
-            if msg == WM_DESTROY:
-                nid = _NID()
-                nid.cbSize = ctypes.sizeof(_NID)
-                nid.hWnd   = hwnd
-                nid.uID    = 1
-                shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
-                u32.PostQuitMessage(0)
-                self._stop.set()
-                return 0
-            return u32.DefWindowProcW(hwnd, msg, wp, lp)
-
-        self._wndproc_ref = WNDPROC(wnd_proc)
-        hinstance = k32.GetModuleHandleW(None)
-        cls_name  = "HandCtrlTray"
-
-        wc = _WNDCLASSEX()
-        wc.cbSize        = ctypes.sizeof(_WNDCLASSEX)
-        wc.lpfnWndProc   = ctypes.cast(self._wndproc_ref, ctypes.c_void_p)
-        wc.hInstance     = hinstance
-        wc.lpszClassName = cls_name
-        u32.RegisterClassExW(ctypes.byref(wc))
-
-        hwnd = u32.CreateWindowExW(
-            0, cls_name, "Hand Controller",
-            0, 0, 0, 0, 0, -3,   # -3 = HWND_MESSAGE
-            None, hinstance, None,
-        )
-        self._hwnd = hwnd
-
-        hicon = u32.LoadIconW(None, 32512)  # IDI_APPLICATION
-
-        nid = _NID()
-        nid.cbSize           = ctypes.sizeof(_NID)
-        nid.hWnd             = hwnd
-        nid.uID              = 1
-        nid.uFlags           = NIF_MESSAGE | NIF_ICON | NIF_TIP
-        nid.uCallbackMessage = self._WM_TRAY
-        nid.hIcon            = hicon
-        nid.szTip            = "Hand Controller"
-        shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
-
-        msg = _MSG()
-        while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            u32.TranslateMessage(ctypes.byref(msg))
-            u32.DispatchMessageW(ctypes.byref(msg))
-
-        u32.UnregisterClassW(cls_name, hinstance)
+        self._icon = pystray.Icon("HandController", img, "Hand Controller", menu)
+        self._icon.run()
 
     def stop(self):
-        if self._hwnd:
-            ctypes.windll.user32.PostMessageW(self._hwnd, 0x0002, 0, 0)
+        if self._icon:
+            self._icon.stop()
 
 
 # ─────────────────────────────── Main ─────────────────────────────────
@@ -806,20 +928,30 @@ def main():
     last_sound_t = 0.0
     stop_flag    = threading.Event()
 
-    cap = CameraCapture(CAMERA_ID, FRAME_W, FRAME_H)
+    print("Buscando cámaras disponibles...")
+    available_cams = _enumerate_cameras()
+    print(f"  Cámaras encontradas: {available_cams}")
+    current_cam_id = CAMERA_ID if CAMERA_ID in available_cams else available_cams[0]
+    cap = CameraCapture(current_cam_id, RESOLUTIONS)
 
     if not cap.opened:
-        print(f"ERROR: No se pudo abrir la camara {CAMERA_ID}")
+        print(f"ERROR: No se pudo abrir la camara {current_cam_id}")
         return
 
-    ctrl    = HandController()
+    hz    = _get_monitor_hz()
+    mover = _MouseMover(hz)
+    ctrl  = HandController(mover)
     overlay = HandOverlay()
 
-    if headless:
-        tray = _TrayIcon(stop_flag)
-        threading.Thread(target=tray.run, daemon=True).start()
+    tray = _TrayIcon(stop_flag, available_cams, current_cam_id)
+    threading.Thread(target=tray.run, daemon=True).start()
+
+    _ocl = cv2.ocl.haveOpenCL()
+    if _ocl:
+        cv2.ocl.setUseOpenCL(True)
+        print(f"  OpenCL: habilitado  [{cv2.ocl.Device.getDefault().name()}]")
     else:
-        tray = None
+        print("  OpenCL: no disponible, procesando en CPU")
 
     BaseOptions         = mp.tasks.BaseOptions
     HandLandmarker      = mp.tasks.vision.HandLandmarker
@@ -839,9 +971,9 @@ def main():
         running_mode=RunningMode.LIVE_STREAM,
         result_callback=on_result,
         num_hands=2,
-        min_hand_detection_confidence=0.72,
+        min_hand_detection_confidence=0.70,
         min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.65,
+        min_tracking_confidence=0.60,
     )
 
     print("=" * 52)
@@ -855,10 +987,37 @@ def main():
     print("=" * 52)
 
     t0 = time.time()
+    last_frame_id  = -1
+    autoframe_on   = False
+    autoframer: Optional[AutoFramer] = None
+    _face_det      = None
+    preferred_face: Optional[Tuple[float, float]] = None
+    last_faces     = []
+    last_select_t  = 0.0
+    select_hold_t  = 0.0  # momento en que empezó el gesto de selección
+    _face_pos_buf: deque = deque(maxlen=7)
 
     with HandLandmarker.create_from_options(options) as landmarker:
         while cap.opened:
-            ret, frame = cap.read()
+            # ── Cambio de cámara ──────────────────────────────────────
+            req_cam = tray.requested_camera
+            if req_cam != current_cam_id:
+                cap.release()
+                new_cap = CameraCapture(req_cam, RESOLUTIONS)
+                if new_cap.opened:
+                    cap            = new_cap
+                    current_cam_id = req_cam
+                    tray.acknowledge_camera(req_cam)
+                    if autoframe_on and autoframer is not None:
+                        autoframer = AutoFramer(cap.width, cap.height)
+                        _face_pos_buf.clear()
+                else:
+                    new_cap.release()
+                    cap = CameraCapture(current_cam_id, RESOLUTIONS)
+                    tray.acknowledge_camera(current_cam_id)
+                last_frame_id = -1
+
+            ret, frame, frame_id = cap.read()
             if not ret:
                 time.sleep(0.001)
                 continue
@@ -866,80 +1025,179 @@ def main():
             frame = cv2.flip(frame, 1)
             now   = time.time()
 
-            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            ts_ms    = int((now - t0) * 1000)
+            # ── Auto-encuadre ──────────────────────────────────────────
+            autoframe_on = tray.autoframe
+            if autoframe_on and _face_det is None:
+                _face_det  = cv2.CascadeClassifier(
+                    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                )
+                autoframer = AutoFramer(cap.width, cap.height)
+            elif not autoframe_on and _face_det is not None:
+                _face_det  = None
+                autoframer = None
+                _face_pos_buf.clear()
 
-            # No bloqueante: el resultado llega via on_result en otro hilo
-            landmarker.detect_async(mp_image, ts_ms)
+            if autoframe_on and autoframer is not None:
+                fd_w  = int(cap.width  * FACE_DET_SCALE)
+                fd_h  = int(cap.height * FACE_DET_SCALE)
+                small = cv2.resize(frame, (fd_w, fd_h))
+                gray  = cv2.cvtColor(cv2.UMat(small) if _ocl else small,
+                                     cv2.COLOR_BGR2GRAY)
+                min_s = max(15, int(60 * FACE_DET_SCALE))
+                faces = _face_det.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_s, min_s)
+                )
+                if len(faces) > 0:
+                    last_faces = faces
+                    chosen     = _choose_face(last_faces, preferred_face, cap.width, cap.height)
+                    fx, fy, fw, fh = chosen
+                    inv = 1.0 / FACE_DET_SCALE
+                    _face_pos_buf.append(((fx + fw / 2) * inv / cap.width,
+                                          (fy + fh / 2) * inv / cap.height))
+                    avg_nx = sum(p[0] for p in _face_pos_buf) / len(_face_pos_buf)
+                    avg_ny = sum(p[1] for p in _face_pos_buf) / len(_face_pos_buf)
+                    autoframer.update(avg_nx, avg_ny, fw * inv / cap.width)
+                x0, y0, x1, y1 = autoframer.get_crop()
+                frame_mp = frame[y0:y1, x0:x1]
+            else:
+                frame_mp = frame
+
+            # ── Enviar a MediaPipe ─────────────────────────────────────
+            if frame_id != last_frame_id:
+                last_frame_id = frame_id
+                if autoframe_on:
+                    src    = cv2.UMat(frame_mp) if _ocl else frame_mp
+                    mp_src = cv2.resize(src, (cap.width, cap.height))
+                else:
+                    mp_src = cv2.UMat(frame_mp) if _ocl else frame_mp
+                rgb = cv2.cvtColor(mp_src, cv2.COLOR_BGR2RGB)
+                if _ocl:
+                    rgb = rgb.get()
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                ts_ms    = int((now - t0) * 1000)
+                landmarker.detect_async(mp_image, ts_ms)
 
             with _lock:
                 result = _latest[0]
 
-            if result and result.hand_landmarks and result.handedness:
-                lm         = result.hand_landmarks[0]
-                # Tasks API reporta la mano desde perspectiva del modelo (imagen sin flipear)
-                # como flipemos el frame, invertimos la etiqueta para que coincida con
-                # la mano real del usuario
-                raw_label  = result.handedness[0][0].category_name
-                hand_label = "Left" if raw_label == "Right" else "Right"
+            paused = tray.paused if tray else False
+            overlay.set_paused(paused)
 
-                mx, my, fingers, is_fist, is_pinch, is_peace = ctrl.process(lm, hand_label, now)
-                px, py = palm_pos(lm)
-                if not headless:
-                    draw_hand(frame, lm, is_pinch)
-                    draw_hud(frame, ctrl, fingers, is_fist, is_pinch, is_peace, now)
+            try:
+                if paused:
+                    ctrl.no_hand(now)
+                    overlay.update(0.5, 0.5, False)
+                elif result and result.hand_landmarks and result.handedness:
+                    lm         = result.hand_landmarks[0]
+                    raw_label  = result.handedness[0][0].category_name
+                    hand_label = "Left" if raw_label == "Right" else "Right"
 
-                # Gestos de dos manos
-                if len(result.hand_landmarks) >= 2:
-                    lm1    = result.hand_landmarks[1]
-                    raw1   = result.handedness[1][0].category_name
-                    label1 = "Left" if raw1 == "Right" else "Right"
-                    px1, py1 = palm_pos(lm1)
-                    overlay.update(px, py, True, px1, py1, True)
+                    mx, my, fingers, is_fist, is_pinch, is_peace = ctrl.process(lm, hand_label, now)
+                    px, py = palm_pos(lm)
                     if not headless:
-                        draw_hand(frame, lm1)
+                        draw_hand(frame_mp, lm, is_pinch)
+                        draw_hud(frame_mp if autoframe_on else frame, ctrl, fingers, is_fist, is_pinch, is_peace, now)
 
-                    # Doble pinch → zoom (Ctrl + scroll)
-                    both_pinching = (pinch_distance(lm) < PINCH_THRESHOLD and
-                                     pinch_distance(lm1) < PINCH_THRESHOLD)
-                    if both_pinching:
-                        cx0  = (lm[4].x  + lm[8].x)  / 2
-                        cy0  = (lm[4].y  + lm[8].y)  / 2
-                        cx1  = (lm1[4].x + lm1[8].x) / 2
-                        cy1  = (lm1[4].y + lm1[8].y) / 2
-                        dist = math.sqrt((cx0 - cx1)**2 + (cy0 - cy1)**2)
-                        ctrl.update_zoom(True, dist, now)
-                    else:
-                        ctrl.update_zoom(False, 0.0, now)
-                        # Combo: 👉 + 👌
-                        if is_pointing(lm, hand_label) and is_ok_sign(lm1, label1):
-                            combo = hands_united(lm, lm1)
-                        elif is_ok_sign(lm, hand_label) and is_pointing(lm1, label1):
-                            combo = hands_united(lm1, lm)
+                    if len(result.hand_landmarks) >= 2:
+                        lm1    = result.hand_landmarks[1]
+                        raw1   = result.handedness[1][0].category_name
+                        label1 = "Left" if raw1 == "Right" else "Right"
+                        px1, py1 = palm_pos(lm1)
+                        overlay.update(px, py, True, px1, py1, True)
+                        if not headless:
+                            draw_hand(frame_mp, lm1)
+
+                        both_pinching = (pinch_distance(lm) < PINCH_THRESHOLD and
+                                         pinch_distance(lm1) < PINCH_THRESHOLD)
+                        if both_pinching:
+                            cx0  = (lm[4].x  + lm[8].x)  / 2
+                            cy0  = (lm[4].y  + lm[8].y)  / 2
+                            cx1  = (lm1[4].x + lm1[8].x) / 2
+                            cy1  = (lm1[4].y + lm1[8].y) / 2
+                            dist = math.sqrt((cx0 - cx1)**2 + (cy0 - cy1)**2)
+                            ctrl.update_zoom(True, dist, now)
                         else:
-                            combo = False
-                        if combo and now - last_sound_t > SOUND_COOLDOWN:
-                            play_sound(SOUND_SEXY)
-                            last_sound_t = now
+                            ctrl.update_zoom(False, 0.0, now)
+
+                            fingers1  = fingers_open(lm1, label1)
+                            both_open = sum(fingers) >= 4 and sum(fingers1) >= 4
+                            if both_open:
+                                if select_hold_t == 0.0:
+                                    select_hold_t = now
+                                elif (now - select_hold_t >= 1.0
+                                        and autoframe_on and autoframer is not None
+                                        and len(last_faces) > 0
+                                        and now - last_select_t > 2.0):
+                                    crp = autoframer.get_crop()
+                                    cw  = crp[2] - crp[0]
+                                    ch  = crp[3] - crp[1]
+                                    hx  = (palm_pos(lm)[0] + palm_pos(lm1)[0]) / 2
+                                    hy  = (palm_pos(lm)[1] + palm_pos(lm1)[1]) / 2
+                                    hand_nx = (hx * cw + crp[0]) / cap.width
+                                    hand_ny = (hy * ch + crp[1]) / cap.height
+                                    sel     = _choose_face(last_faces, (hand_nx, hand_ny),
+                                                           cap.width, cap.height)
+                                    inv_s   = 1.0 / FACE_DET_SCALE
+                                    preferred_face = (
+                                        (sel[0] + sel[2] / 2) * inv_s / cap.width,
+                                        (sel[1] + sel[3] / 2) * inv_s / cap.height,
+                                    )
+                                    last_select_t = now
+                                    select_hold_t = 0.0
+                                    ctrl._flash("SELECCIONADO")
+                            else:
+                                select_hold_t = 0.0
+
+                            if is_pointing(lm, hand_label) and is_ok_sign(lm1, label1):
+                                combo = hands_united(lm, lm1)
+                            elif is_ok_sign(lm, hand_label) and is_pointing(lm1, label1):
+                                combo = hands_united(lm1, lm)
+                            else:
+                                combo = False
+                            if combo and now - last_sound_t > SOUND_COOLDOWN:
+                                play_sound(SOUND_SEXY)
+                                last_sound_t = now
+                    else:
+                        overlay.update(px, py, True)
+                        ctrl.update_zoom(False, 0.0, now)
                 else:
-                    overlay.update(px, py, True)
-                    ctrl.update_zoom(False, 0.0, now)
-            else:
+                    ctrl.no_hand(now)
+                    overlay.update(0.5, 0.5, False)
+                    if not headless:
+                        draw_hud(frame_mp if autoframe_on else frame, ctrl, [False] * 5, False, False, False, now)
+            except pyautogui.FailSafeException:
+                ctrl.cleanup()
                 ctrl.no_hand(now)
                 overlay.update(0.5, 0.5, False)
-                if not headless:
-                    draw_hud(frame, ctrl, [False] * 5, False, False, False, now)
 
             if headless:
                 if stop_flag.is_set():
                     break
             else:
-                cv2.imshow("Controlador de Mano  |  ESC = salir", frame)
-                if cv2.waitKey(1) & 0xFF == 27:
+                if autoframe_on:
+                    display = cv2.resize(frame_mp, (cap.width, cap.height))
+                else:
+                    display = frame
+                if DISPLAY_SCALE != 1.0:
+                    dw = int(cap.width  * DISPLAY_SCALE)
+                    dh = int(cap.height * DISPLAY_SCALE)
+                    display = cv2.resize(display, (dw, dh))
+                bar_w = display.shape[1]
+                hud   = np.zeros((HUD_BAR_H, bar_w, 3), np.uint8)
+                cv2.putText(hud, ctrl.status, (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 210, 210), 1, cv2.LINE_AA)
+                for i, line in enumerate(_HUD_LEGENDS):
+                    x = 10 if i < 3 else bar_w // 2
+                    y = 46 + (i % 3) * 18
+                    cv2.putText(hud, line, (x, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.36, (130, 130, 130), 1, cv2.LINE_AA)
+                cv2.imshow("Controlador de Mano  |  ESC = salir",
+                           np.vstack([display, hud]))
+                if cv2.waitKey(1) & 0xFF == 27 or stop_flag.is_set():
                     break
 
     ctrl.cleanup()
+    mover.stop()
     overlay.close()
     if tray:
         tray.stop()
@@ -948,6 +1206,9 @@ def main():
         cv2.destroyAllWindows()
 
     print("Cerrando.")
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if hwnd:
+        ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
 
 
 if __name__ == "__main__":
